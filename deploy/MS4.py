@@ -4,22 +4,17 @@ MS4.py — drop-in replacement for Model_Def/MS4.py on Carya.
 scp to:
     /project/rhu/PulseBP/Pulse/PulseDB_multi_full/Model_Training/Model_Def/MS4.py
 
-What changed vs baseline:
-  - S4Model: VERBATIM COPY — untouched, same s42 import, same parameters.
-  - MS4_1D: fusion replaced with FiLM conditioning.
-      * Demographics (3-dim) predict per-channel scale+shift of 512-dim S4 output.
-      * Zero-initialized: model starts identical to original, then learns to modulate.
-      * Directly addresses paper Section 5: "512-dim output dominates; demographic
-        contribution becomes marginal via simple concatenation."
-      * Paper's own future-work suggestion: "cross-modal conditioning."
-  - MS4_1D_Gate: sigmoid gate — demographics suppress/amplify S4 channels.
-      * Paper's own future-work suggestion: "attention/gating."
-  - MS4_1D_FiLMGate: FiLM then gate combined.
+Architecture (based on MS4_2.py which was never run through the bootstrap):
+  - S4Model: VERBATIM COPY from original MS4.py — untouched.
+  - S4Block: pre-norm residual block with S4 + pointwise FFN (like a Transformer block).
+  - AttnPool1D: attention-weighted pooling over time (learned, vs. dumb mean pool).
+  - FiLM: applied to the FULL SEQUENCE (B, L, C) before pooling — modulates all
+    timesteps, not just the pooled vector. This is strictly better than post-pool FiLM.
 
-Bootstrap usage (MODEL_NAME = "ms4" unchanged):
-    MS4_1D (FiLM) runs automatically — no other file needs to change.
-
-Variant runs use scripts/train_ms4plus_carya.py --variant gate|filmgate.
+Variants (all share the same S4/S4Block/stem — only fusion differs):
+  MS4_1D        — conv stem + S4Block + sequence FiLM + attn pool  [bootstrap default]
+  MS4_1D_Gate   — same but sigmoid gate on sequence instead of FiLM
+  MS4_1D_FiLMGate — FiLM then gate, both on sequence
 """
 import torch
 import torch.nn as nn
@@ -97,7 +92,7 @@ class S4Model(nn.Module):
             x = z + x
             if not self.prenorm:
                 x = norm(x.transpose(-1, -2)).transpose(-1, -2) if self.layer_norm else norm(z)
-        x = x.transpose(-1, -2)  # (B, L, d_model)
+        x = x.transpose(-1, -2)
         if self.pooling:
             x = x.mean(dim=1)
         if self.decoder is not None:
@@ -108,140 +103,210 @@ class S4Model(nn.Module):
 
 
 # =============================================================================
-# MS4_1D — FiLM fusion (replaces original concat fusion)
+# Building blocks (from MS4_2.py)
+# =============================================================================
+
+class S4Block(nn.Module):
+    """Pre-norm residual block: S4 + pointwise FFN (like a Transformer block)."""
+    def __init__(self, d_model, d_state=64, l_max=2048, dropout=0.2, bidirectional=True):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.s4 = S42(d_state=d_state, l_max=l_max, d_model=d_model,
+                      bidirectional=bidirectional, postact='glu',
+                      dropout=dropout, transposed=True)
+        self.drop = nn.Dropout(dropout)
+        self.ffn = nn.Sequential(
+            nn.Conv1d(d_model, 4 * d_model, kernel_size=1), nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Conv1d(4 * d_model, d_model, kernel_size=1),
+        )
+
+    def forward(self, x, rate=1.0):  # x: (B, C, L)
+        y = self.norm1(x.transpose(-1, -2)).transpose(-1, -2)
+        y, _ = self.s4(y, rate=rate)
+        x = x + self.drop(y)
+        y = self.norm2(x.transpose(-1, -2)).transpose(-1, -2)
+        x = x + self.drop(self.ffn(y))
+        return x
+
+
+class AttnPool1D(nn.Module):
+    """Learned attention pooling over time — smarter than mean pool."""
+    def __init__(self, d_model, hidden=128):
+        super().__init__()
+        self.scorer = nn.Sequential(nn.Linear(d_model, hidden), nn.Tanh(), nn.Linear(hidden, 1))
+
+    def forward(self, x):  # x: (B, L, C)
+        w = torch.softmax(self.scorer(x).squeeze(-1), dim=1)  # (B, L)
+        return torch.bmm(w.unsqueeze(1), x).squeeze(1)         # (B, C)
+
+
+class _FiLM(nn.Module):
+    """FiLM on sequence: modulates (B, L, C) given static embedding (B, D)."""
+    def __init__(self, static_dim, d_model):
+        super().__init__()
+        self.proj = nn.Linear(static_dim, 2 * d_model)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x, s):  # x: (B, L, C),  s: (B, D)
+        gamma, beta = self.proj(s).chunk(2, dim=-1)  # (B, C) each
+        return x * (1.0 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
+
+
+class _Gate(nn.Module):
+    """Sigmoid gate on sequence: demographics suppress/amplify each channel."""
+    def __init__(self, static_dim, d_model):
+        super().__init__()
+        self.proj = nn.Linear(static_dim, d_model)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.constant_(self.proj.bias, 1.0)
+
+    def forward(self, x, s):  # x: (B, L, C),  s: (B, D)
+        g = torch.sigmoid(self.proj(s)).unsqueeze(1)  # (B, 1, C)
+        return x * g
+
+
+# =============================================================================
+# MS4_1D — FiLM on sequence  [bootstrap default: MODEL_NAME = "ms4"]
 # =============================================================================
 
 class MS4_1D(nn.Module):
     """
-    Drop-in for MODEL_NAME = "ms4" in Model_training_bootstrap.py.
+    Conv stem → S4Blocks → sequence FiLM → attention pool → head.
 
-    S4 backbone: identical to original (d_model=512, n_layers=4, d_state=64, l_max=2048).
-    Fusion: FiLM — demographics predict per-channel scale+shift of S4 output.
-    Zero-init on FiLM layer so the model starts as the original and learns to modulate.
+    Improvements over baseline MS4.py:
+      1. Conv stem (k=5, k=3) extracts local PPG morphology before S4.
+      2. S4Block adds pointwise FFN after each S4 layer (Transformer-style).
+      3. FiLM on the sequence (B,L,C) — demographics modulate ALL timesteps,
+         not just the pooled summary. This is the key fix for feature dominance.
+      4. AttnPool1D — learned weighted pooling vs. mean pool.
     """
 
     def __init__(self, num_static_features=3, num_BP=1,
-                 s4_d_model=512, s4_n_layers=4, s4_d_state=64, s4_l_max=2048,
-                 demo_hidden=64, dropout=0.1,
-                 # legacy args kept so existing call-sites don't break
-                 static_hidden=16, fusion_hidden=32,
-                 s4_d_input=1, s4_pooling=True):
+                 static_hidden=32, fusion_hidden=64,
+                 s4_d_input=1, s4_d_model=256, s4_n_layers=4,
+                 s4_pooling=True, s4_l_max=2048, dropout=0.2):
         super().__init__()
-        self.s4model = S4Model(
-            d_input=s4_d_input, d_output=None, d_state=s4_d_state,
-            d_model=s4_d_model, n_layers=s4_n_layers,
-            pooling=s4_pooling, l_max=s4_l_max,
-        )
-        D = s4_d_model  # 512
+        D = s4_d_model
 
-        self.demo_mlp = nn.Sequential(
-            nn.Linear(num_static_features, demo_hidden), nn.GELU(),
-            nn.Linear(demo_hidden, demo_hidden), nn.GELU(),
+        self.stem = nn.Sequential(
+            nn.Conv1d(s4_d_input, D, kernel_size=5, padding=2), nn.GELU(),
+            nn.Conv1d(D, D, kernel_size=3, padding=1), nn.GELU(),
         )
-        # FiLM: predict gamma and beta — zero-init for identity at step 0
-        self.film = nn.Linear(demo_hidden, D * 2)
-        nn.init.zeros_(self.film.weight)
-        nn.init.zeros_(self.film.bias)
-
+        self.blocks = nn.ModuleList([
+            S4Block(D, d_state=64, l_max=s4_l_max, dropout=dropout)
+            for _ in range(s4_n_layers)
+        ])
+        self.static_mlp = nn.Sequential(
+            nn.Linear(num_static_features, static_hidden), nn.ReLU(inplace=True),
+            nn.Linear(static_hidden, static_hidden), nn.ReLU(inplace=True),
+        )
+        self.film = _FiLM(static_hidden, D)
+        self.pool = AttnPool1D(D, hidden=128)
         self.head = nn.Sequential(
-            nn.Linear(D, 256), nn.ReLU(inplace=True),
+            nn.Linear(D + static_hidden, fusion_hidden), nn.ReLU(inplace=True),
             nn.Dropout(dropout),
-            nn.Linear(256, 32), nn.ReLU(inplace=True),
-            nn.Linear(32, num_BP),
+            nn.Linear(fusion_hidden, num_BP),
         )
 
     def forward(self, ppg, static_feat):
-        """ppg: (B, 1, L)   static_feat: (B, num_static_features)"""
-        s4_out = self.s4model(ppg)              # (B, 512)
-        demo   = self.demo_mlp(static_feat)     # (B, 64)
-        params = self.film(demo)                # (B, 1024)
-        gamma, beta = params[:, :512], params[:, 512:]
-        s4_out = (1.0 + gamma) * s4_out + beta  # FiLM
-        return self.head(s4_out).squeeze(-1)    # (B,)
+        x = self.stem(ppg)                        # (B, C, L)
+        for blk in self.blocks:
+            x = blk(x)
+        x = x.transpose(-1, -2)                   # (B, L, C)
+        s = self.static_mlp(static_feat)           # (B, static_hidden)
+        x = self.film(x, s)                        # (B, L, C) — FiLM on sequence
+        x = self.pool(x)                           # (B, C)
+        return self.head(torch.cat([x, s], dim=-1)).squeeze(-1)
 
 
 # =============================================================================
-# MS4_1D_Gate — sigmoid gating variant
+# MS4_1D_Gate — gate on sequence instead of FiLM
 # =============================================================================
 
 class MS4_1D_Gate(nn.Module):
-    """
-    Demographics predict a sigmoid gate over 512-dim S4 output.
-    Gate init bias=1 so sigmoid(1)≈0.73 — softly open at start.
-    """
+    """Same backbone as MS4_1D but uses sigmoid gate instead of FiLM."""
 
     def __init__(self, num_static_features=3, num_BP=1,
-                 s4_d_model=512, s4_n_layers=4, s4_d_state=64, s4_l_max=2048,
-                 demo_hidden=64, dropout=0.1):
+                 static_hidden=32, fusion_hidden=64,
+                 s4_d_input=1, s4_d_model=256, s4_n_layers=4,
+                 s4_l_max=2048, dropout=0.2):
         super().__init__()
-        self.s4model = S4Model(
-            d_input=1, d_output=None, d_state=s4_d_state,
-            d_model=s4_d_model, n_layers=s4_n_layers,
-            pooling=True, l_max=s4_l_max,
-        )
         D = s4_d_model
-        self.demo_mlp = nn.Sequential(
-            nn.Linear(num_static_features, demo_hidden), nn.GELU(),
-            nn.Linear(demo_hidden, demo_hidden), nn.GELU(),
+        self.stem = nn.Sequential(
+            nn.Conv1d(s4_d_input, D, kernel_size=5, padding=2), nn.GELU(),
+            nn.Conv1d(D, D, kernel_size=3, padding=1), nn.GELU(),
         )
-        self.gate_linear = nn.Linear(demo_hidden, D)
-        nn.init.zeros_(self.gate_linear.weight)
-        nn.init.constant_(self.gate_linear.bias, 1.0)
+        self.blocks = nn.ModuleList([
+            S4Block(D, d_state=64, l_max=s4_l_max, dropout=dropout)
+            for _ in range(s4_n_layers)
+        ])
+        self.static_mlp = nn.Sequential(
+            nn.Linear(num_static_features, static_hidden), nn.ReLU(inplace=True),
+            nn.Linear(static_hidden, static_hidden), nn.ReLU(inplace=True),
+        )
+        self.gate = _Gate(static_hidden, D)
+        self.pool = AttnPool1D(D, hidden=128)
         self.head = nn.Sequential(
-            nn.Linear(D, 256), nn.ReLU(inplace=True),
+            nn.Linear(D + static_hidden, fusion_hidden), nn.ReLU(inplace=True),
             nn.Dropout(dropout),
-            nn.Linear(256, 32), nn.ReLU(inplace=True),
-            nn.Linear(32, num_BP),
+            nn.Linear(fusion_hidden, num_BP),
         )
 
     def forward(self, ppg, static_feat):
-        s4_out = self.s4model(ppg)
-        demo   = self.demo_mlp(static_feat)
-        gate   = torch.sigmoid(self.gate_linear(demo))
-        s4_out = s4_out * gate
-        return self.head(s4_out).squeeze(-1)
+        x = self.stem(ppg)
+        for blk in self.blocks:
+            x = blk(x)
+        x = x.transpose(-1, -2)
+        s = self.static_mlp(static_feat)
+        x = self.gate(x, s)
+        x = self.pool(x)
+        return self.head(torch.cat([x, s], dim=-1)).squeeze(-1)
 
 
 # =============================================================================
-# MS4_1D_FiLMGate — FiLM then gate combined
+# MS4_1D_FiLMGate — FiLM then gate, both on sequence
 # =============================================================================
 
 class MS4_1D_FiLMGate(nn.Module):
-    """FiLM scale+shift, then sigmoid gate."""
+    """FiLM scale+shift, then sigmoid gate — both applied to sequence."""
 
     def __init__(self, num_static_features=3, num_BP=1,
-                 s4_d_model=512, s4_n_layers=4, s4_d_state=64, s4_l_max=2048,
-                 demo_hidden=64, dropout=0.1):
+                 static_hidden=32, fusion_hidden=64,
+                 s4_d_input=1, s4_d_model=256, s4_n_layers=4,
+                 s4_l_max=2048, dropout=0.2):
         super().__init__()
-        self.s4model = S4Model(
-            d_input=1, d_output=None, d_state=s4_d_state,
-            d_model=s4_d_model, n_layers=s4_n_layers,
-            pooling=True, l_max=s4_l_max,
-        )
         D = s4_d_model
-        self.demo_mlp = nn.Sequential(
-            nn.Linear(num_static_features, demo_hidden), nn.GELU(),
-            nn.Linear(demo_hidden, demo_hidden), nn.GELU(),
+        self.stem = nn.Sequential(
+            nn.Conv1d(s4_d_input, D, kernel_size=5, padding=2), nn.GELU(),
+            nn.Conv1d(D, D, kernel_size=3, padding=1), nn.GELU(),
         )
-        self.film = nn.Linear(demo_hidden, D * 2)
-        nn.init.zeros_(self.film.weight)
-        nn.init.zeros_(self.film.bias)
-        self.gate_linear = nn.Linear(demo_hidden, D)
-        nn.init.zeros_(self.gate_linear.weight)
-        nn.init.constant_(self.gate_linear.bias, 1.0)
+        self.blocks = nn.ModuleList([
+            S4Block(D, d_state=64, l_max=s4_l_max, dropout=dropout)
+            for _ in range(s4_n_layers)
+        ])
+        self.static_mlp = nn.Sequential(
+            nn.Linear(num_static_features, static_hidden), nn.ReLU(inplace=True),
+            nn.Linear(static_hidden, static_hidden), nn.ReLU(inplace=True),
+        )
+        self.film = _FiLM(static_hidden, D)
+        self.gate = _Gate(static_hidden, D)
+        self.pool = AttnPool1D(D, hidden=128)
         self.head = nn.Sequential(
-            nn.Linear(D, 256), nn.ReLU(inplace=True),
+            nn.Linear(D + static_hidden, fusion_hidden), nn.ReLU(inplace=True),
             nn.Dropout(dropout),
-            nn.Linear(256, 32), nn.ReLU(inplace=True),
-            nn.Linear(32, num_BP),
+            nn.Linear(fusion_hidden, num_BP),
         )
 
     def forward(self, ppg, static_feat):
-        s4_out = self.s4model(ppg)
-        demo   = self.demo_mlp(static_feat)
-        params = self.film(demo)
-        gamma, beta = params[:, :512], params[:, 512:]
-        s4_out = (1.0 + gamma) * s4_out + beta
-        gate   = torch.sigmoid(self.gate_linear(demo))
-        s4_out = s4_out * gate
-        return self.head(s4_out).squeeze(-1)
+        x = self.stem(ppg)
+        for blk in self.blocks:
+            x = blk(x)
+        x = x.transpose(-1, -2)
+        s = self.static_mlp(static_feat)
+        x = self.film(x, s)
+        x = self.gate(x, s)
+        x = self.pool(x)
+        return self.head(torch.cat([x, s], dim=-1)).squeeze(-1)
