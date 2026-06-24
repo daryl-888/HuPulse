@@ -1,1 +1,1 @@
-from .ms4_improved import MS4Plus
+from .ms4_improved import MS4Plus_1D

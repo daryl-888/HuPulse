@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from models.ms4_improved import MS4Plus
+from models.ms4_improved import MS4Plus_1D as MS4Plus
 from data.pulsedb import PulseDBDataset
 from utils.metrics import compute_metrics, print_metrics
 
