@@ -199,6 +199,7 @@ class MS4_1D(nn.Module):
             S4Block(D, d_state=64, l_max=s4_l_max, dropout=dropout)
             for _ in range(s4_n_layers)
         ])
+        self.static_norm = nn.BatchNorm1d(num_static_features)
         self.static_mlp = nn.Sequential(
             nn.Linear(num_static_features, static_hidden), nn.ReLU(inplace=True),
             nn.Linear(static_hidden, static_hidden), nn.ReLU(inplace=True),
@@ -216,7 +217,7 @@ class MS4_1D(nn.Module):
         for blk in self.blocks:
             x = blk(x)
         x = x.transpose(-1, -2)                   # (B, L, C)
-        s = self.static_mlp(static_feat)           # (B, static_hidden)
+        s = self.static_mlp(self.static_norm(static_feat))  # (B, static_hidden)
         x = self.film(x, s)                        # (B, L, C) — FiLM on sequence
         x = self.pool(x)                           # (B, C)
         return self.head(torch.cat([x, s], dim=-1)).squeeze(-1)
@@ -243,6 +244,7 @@ class MS4_1D_Gate(nn.Module):
             S4Block(D, d_state=64, l_max=s4_l_max, dropout=dropout)
             for _ in range(s4_n_layers)
         ])
+        self.static_norm = nn.BatchNorm1d(num_static_features)
         self.static_mlp = nn.Sequential(
             nn.Linear(num_static_features, static_hidden), nn.ReLU(inplace=True),
             nn.Linear(static_hidden, static_hidden), nn.ReLU(inplace=True),
@@ -260,7 +262,7 @@ class MS4_1D_Gate(nn.Module):
         for blk in self.blocks:
             x = blk(x)
         x = x.transpose(-1, -2)
-        s = self.static_mlp(static_feat)
+        s = self.static_mlp(self.static_norm(static_feat))
         x = self.gate(x, s)
         x = self.pool(x)
         return self.head(torch.cat([x, s], dim=-1)).squeeze(-1)
@@ -287,6 +289,7 @@ class MS4_1D_FiLMGate(nn.Module):
             S4Block(D, d_state=64, l_max=s4_l_max, dropout=dropout)
             for _ in range(s4_n_layers)
         ])
+        self.static_norm = nn.BatchNorm1d(num_static_features)
         self.static_mlp = nn.Sequential(
             nn.Linear(num_static_features, static_hidden), nn.ReLU(inplace=True),
             nn.Linear(static_hidden, static_hidden), nn.ReLU(inplace=True),
@@ -305,7 +308,7 @@ class MS4_1D_FiLMGate(nn.Module):
         for blk in self.blocks:
             x = blk(x)
         x = x.transpose(-1, -2)
-        s = self.static_mlp(static_feat)
+        s = self.static_mlp(self.static_norm(static_feat))
         x = self.film(x, s)
         x = self.gate(x, s)
         x = self.pool(x)

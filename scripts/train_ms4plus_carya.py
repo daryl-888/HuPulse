@@ -174,6 +174,7 @@ class MS4_FiLM(nn.Module):
             S4Block(D, d_state=64, l_max=s4_l_max, dropout=dropout)
             for _ in range(s4_n_layers)
         ])
+        self.static_norm = nn.BatchNorm1d(num_static_features)
         self.static_mlp = nn.Sequential(
             nn.Linear(num_static_features, static_hidden), nn.ReLU(inplace=True),
             nn.Linear(static_hidden, static_hidden), nn.ReLU(inplace=True),
@@ -190,7 +191,7 @@ class MS4_FiLM(nn.Module):
         for blk in self.blocks:
             x = blk(x)
         x = x.transpose(-1, -2)
-        s = self.static_mlp(static_feat)
+        s = self.static_mlp(self.static_norm(static_feat))
         x = self.film(x, s)
         x = self.pool(x)
         return self.head(torch.cat([x, s], dim=-1)).squeeze(-1)
@@ -212,6 +213,7 @@ class MS4_Gate(nn.Module):
             S4Block(D, d_state=64, l_max=s4_l_max, dropout=dropout)
             for _ in range(s4_n_layers)
         ])
+        self.static_norm = nn.BatchNorm1d(num_static_features)
         self.static_mlp = nn.Sequential(
             nn.Linear(num_static_features, static_hidden), nn.ReLU(inplace=True),
             nn.Linear(static_hidden, static_hidden), nn.ReLU(inplace=True),
@@ -228,7 +230,7 @@ class MS4_Gate(nn.Module):
         for blk in self.blocks:
             x = blk(x)
         x = x.transpose(-1, -2)
-        s = self.static_mlp(static_feat)
+        s = self.static_mlp(self.static_norm(static_feat))
         x = self.gate(x, s)
         x = self.pool(x)
         return self.head(torch.cat([x, s], dim=-1)).squeeze(-1)
@@ -250,6 +252,7 @@ class MS4_FiLMGate(nn.Module):
             S4Block(D, d_state=64, l_max=s4_l_max, dropout=dropout)
             for _ in range(s4_n_layers)
         ])
+        self.static_norm = nn.BatchNorm1d(num_static_features)
         self.static_mlp = nn.Sequential(
             nn.Linear(num_static_features, static_hidden), nn.ReLU(inplace=True),
             nn.Linear(static_hidden, static_hidden), nn.ReLU(inplace=True),
@@ -267,7 +270,7 @@ class MS4_FiLMGate(nn.Module):
         for blk in self.blocks:
             x = blk(x)
         x = x.transpose(-1, -2)
-        s = self.static_mlp(static_feat)
+        s = self.static_mlp(self.static_norm(static_feat))
         x = self.film(x, s)
         x = self.gate(x, s)
         x = self.pool(x)
@@ -340,23 +343,34 @@ def to_device(batch, device):
     if not isinstance(y, torch.Tensor): y = torch.from_numpy(np.array(y, dtype=np.float32))
     return (sig.to(device), sf.to(device)), y.to(device).view(-1)
 
-def mae(a, b):          return float(np.mean(np.abs(a - b)))
-def rmse(a, b):         return float(np.sqrt(np.mean((a - b) ** 2)))
+def mae(a, b):      return float(np.mean(np.abs(a - b)))
+def rmse(a, b):     return float(np.sqrt(np.mean((a - b) ** 2)))
 def r2(a, b):
     ss = np.sum((a - b) ** 2); st = np.sum((a - np.mean(a)) ** 2)
     return float(1 - ss / st) if st > 0 else float("nan")
-def std_ae(a, b):       return float(np.std(np.abs(a - b), ddof=1)) if len(a) > 1 else 0.0
+def mean_err(a, b): return float(np.mean(b - a))          # signed: pred - true
+def std_err(a, b):  return float(np.std(b - a, ddof=1)) if len(a) > 1 else 0.0  # AAMI std
 
 @torch.no_grad()
 def evaluate(model, ds, device, batch_size=256) -> Dict[str, float]:
     model.eval()
     ys, ps = [], []
-    for batch in DataLoader(ds, batch_size=batch_size, shuffle=False):
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
+    for batch in loader:
         (sig, sf), y = to_device(batch, device)
-        ps.append(model(sig, sf).view(-1).cpu().numpy())
+        out = model(sig, sf)
+        if hasattr(model, "module"):   # DataParallel wrapper
+            out = out
+        ps.append(out.view(-1).cpu().numpy())
         ys.append(y.view(-1).cpu().numpy())
     yt, yp = np.concatenate(ys), np.concatenate(ps)
-    return {"MAE": mae(yt, yp), "RMSE": rmse(yt, yp), "R2": r2(yt, yp), "STD": std_ae(yt, yp)}
+    return {
+        "MAE":      mae(yt, yp),
+        "RMSE":     rmse(yt, yp),
+        "R2":       r2(yt, yp),
+        "MEAN_ERR": mean_err(yt, yp),   # signed mean error (AAMI numerator)
+        "STD_ERR":  std_err(yt, yp),    # std of signed errors (AAMI denominator)
+    }
 
 def train_one_epoch(model, loader, optimizer, criterion, device):
     model.train(); running = n = 0
@@ -391,29 +405,30 @@ def main():
     cf_data    = Build_Dataset(TEST_CALFREE_FILE,  BP)
 
     torch.cuda.empty_cache()
+    n_gpus = torch.cuda.device_count()
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print("Device:", device)
-    if torch.cuda.is_available():
-        print(torch.cuda.get_device_name(0))
+    print(f"Device: {device}  GPUs available: {n_gpus}")
+    for i in range(n_gpus):
+        print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
 
     per_epoch_csv = os.path.join(OUT_DIR, f"{BP}_per_epoch_metrics.csv")
     with open(per_epoch_csv, "w", newline="") as f:
         csv.writer(f).writerow([
             "fold","epoch","train_loss",
-            "calbased_MAE","calbased_RMSE","calbased_R2","calbased_STD",
-            "calfree_MAE","calfree_RMSE","calfree_R2","calfree_STD",
+            "cb_MAE","cb_RMSE","cb_R2","cb_MEAN_ERR","cb_STD_ERR",
+            "cf_MAE","cf_RMSE","cf_R2","cf_MEAN_ERR","cf_STD_ERR",
         ])
 
     per_fold_csv = os.path.join(OUT_DIR, f"{BP}_per_fold_best.csv")
     with open(per_fold_csv, "w", newline="") as f:
         csv.writer(f).writerow([
             "fold",
-            "best_cb_MAE","best_cb_epoch","best_cb_STD","best_cb_R2",
-            "best_cf_MAE","best_cf_epoch","best_cf_STD","best_cf_R2",
+            "best_cb_MAE","best_cb_epoch","best_cb_MEAN_ERR","best_cb_STD_ERR","best_cb_R2",
+            "best_cf_MAE","best_cf_epoch","best_cf_MEAN_ERR","best_cf_STD_ERR","best_cf_R2",
         ])
 
-    N       = len(train_data)
-    kf      = KFold(n_splits=N_SPLITS, shuffle=True, random_state=SEED)
+    N        = len(train_data)
+    kf       = KFold(n_splits=N_SPLITS, shuffle=True, random_state=SEED)
     ModelCls = VARIANTS[variant]
     best_cb_list, best_cf_list = [], []
 
@@ -423,14 +438,18 @@ def main():
         train_loader = DataLoader(ds_train, batch_size=BATCH_SIZE, shuffle=True, drop_last=False)
 
         Seed(SEED + fold_id)
-        model     = ModelCls(num_static_features=3, num_BP=1).to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=LR, betas=BETAS, weight_decay=WEIGHT_DECAY)
+        _model    = ModelCls(num_static_features=3, num_BP=1).to(device)
+        model     = nn.DataParallel(_model) if n_gpus > 1 else _model
+        optimizer = torch.optim.Adam(_model.parameters(), lr=LR, betas=BETAS, weight_decay=WEIGHT_DECAY)
         criterion = nn.MSELoss()
 
-        best_cb = {"MAE": float("inf"), "epoch": -1, "STD": None, "R2": None}
-        best_cf = {"MAE": float("inf"), "epoch": -1, "STD": None, "R2": None}
+        best_cb = {"MAE": float("inf"), "epoch": -1, "MEAN_ERR": None, "STD_ERR": None, "R2": None}
+        best_cf = {"MAE": float("inf"), "epoch": -1, "MEAN_ERR": None, "STD_ERR": None, "R2": None}
         fold_dir = os.path.join(OUT_DIR, f"fold_{fold_id}")
         os.makedirs(fold_dir, exist_ok=True)
+
+        def save_ckpt(path):
+            torch.save(_model.state_dict(), path)
 
         for epoch in range(1, NUM_EPOCHS + 1):
             loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
@@ -440,71 +459,69 @@ def main():
             with open(per_epoch_csv, "a", newline="") as f:
                 csv.writer(f).writerow([
                     fold_id, epoch, f"{loss:.6f}",
-                    f"{cb['MAE']:.6f}", f"{cb['RMSE']:.6f}", f"{cb['R2']:.6f}", f"{cb['STD']:.6f}",
-                    f"{cf['MAE']:.6f}", f"{cf['RMSE']:.6f}", f"{cf['R2']:.6f}", f"{cf['STD']:.6f}",
+                    f"{cb['MAE']:.6f}", f"{cb['RMSE']:.6f}", f"{cb['R2']:.6f}",
+                    f"{cb['MEAN_ERR']:.6f}", f"{cb['STD_ERR']:.6f}",
+                    f"{cf['MAE']:.6f}", f"{cf['RMSE']:.6f}", f"{cf['R2']:.6f}",
+                    f"{cf['MEAN_ERR']:.6f}", f"{cf['STD_ERR']:.6f}",
                 ])
 
             if cb["MAE"] < best_cb["MAE"]:
-                best_cb = {"MAE": cb["MAE"], "epoch": epoch, "STD": cb["STD"], "R2": cb["R2"]}
-                torch.save(model.state_dict(), os.path.join(fold_dir, f"{BP}_fold{fold_id}_best_cb.pth"))
+                best_cb = {"MAE": cb["MAE"], "epoch": epoch,
+                           "MEAN_ERR": cb["MEAN_ERR"], "STD_ERR": cb["STD_ERR"], "R2": cb["R2"]}
+                save_ckpt(os.path.join(fold_dir, f"{BP}_fold{fold_id}_best_cb.pth"))
 
             if cf["MAE"] < best_cf["MAE"]:
-                best_cf = {"MAE": cf["MAE"], "epoch": epoch, "STD": cf["STD"], "R2": cf["R2"]}
-                torch.save(model.state_dict(), os.path.join(fold_dir, f"{BP}_fold{fold_id}_best_cf.pth"))
+                best_cf = {"MAE": cf["MAE"], "epoch": epoch,
+                           "MEAN_ERR": cf["MEAN_ERR"], "STD_ERR": cf["STD_ERR"], "R2": cf["R2"]}
+                save_ckpt(os.path.join(fold_dir, f"{BP}_fold{fold_id}_best_cf.pth"))
 
-        torch.save(model.state_dict(), os.path.join(fold_dir, f"{BP}_fold{fold_id}_final.pth"))
+        save_ckpt(os.path.join(fold_dir, f"{BP}_fold{fold_id}_final.pth"))
 
         with open(per_fold_csv, "a", newline="") as f:
             csv.writer(f).writerow([
                 fold_id,
-                f"{best_cb['MAE']:.6f}", best_cb["epoch"], f"{best_cb['STD']:.6f}", f"{best_cb['R2']:.6f}",
-                f"{best_cf['MAE']:.6f}", best_cf["epoch"], f"{best_cf['STD']:.6f}", f"{best_cf['R2']:.6f}",
+                f"{best_cb['MAE']:.6f}", best_cb["epoch"],
+                f"{best_cb['MEAN_ERR']:.6f}", f"{best_cb['STD_ERR']:.6f}", f"{best_cb['R2']:.6f}",
+                f"{best_cf['MAE']:.6f}", best_cf["epoch"],
+                f"{best_cf['MEAN_ERR']:.6f}", f"{best_cf['STD_ERR']:.6f}", f"{best_cf['R2']:.6f}",
             ])
-        best_cb_list.append(best_cb["MAE"])
-        best_cf_list.append(best_cf["MAE"])
+        best_cb_list.append(best_cb)
+        best_cf_list.append(best_cf)
 
         print(f"[Fold {fold_id}] CalBased MAE={best_cb['MAE']:.4f} @ ep{best_cb['epoch']}  "
-              f"STD={best_cb['STD']:.4f}  R2={best_cb['R2']:.4f}")
+              f"MeanErr={best_cb['MEAN_ERR']:.4f}  STD={best_cb['STD_ERR']:.4f}  R2={best_cb['R2']:.4f}")
         print(f"[Fold {fold_id}] CalFree  MAE={best_cf['MAE']:.4f} @ ep{best_cf['epoch']}  "
-              f"STD={best_cf['STD']:.4f}  R2={best_cf['R2']:.4f}")
+              f"MeanErr={best_cf['MEAN_ERR']:.4f}  STD={best_cf['STD_ERR']:.4f}  R2={best_cf['R2']:.4f}")
 
-    # ── Final summary with best numbers per split + AAMI check ───────────────
-    # Load best checkpoint per fold and re-evaluate to get mean/STD per split
-    # (already tracked above; collect from per_fold_best.csv rows)
-    cb_arr = np.array(best_cb_list)
-    cf_arr = np.array(best_cf_list)
+    # ── Final summary ────────────────────────────────────────────────────────
+    cb_mae  = np.array([r["MAE"]      for r in best_cb_list])
+    cf_mae  = np.array([r["MAE"]      for r in best_cf_list])
+    cb_me   = np.array([r["MEAN_ERR"] for r in best_cb_list])
+    cf_me   = np.array([r["MEAN_ERR"] for r in best_cf_list])
+    cb_se   = np.array([r["STD_ERR"]  for r in best_cb_list])
+    cf_se   = np.array([r["STD_ERR"]  for r in best_cf_list])
 
-    # Re-read per-fold STD values from the CSV (saved above)
-    import csv as _csv
-    cb_stds, cf_stds = [], []
-    with open(per_fold_csv) as f:
-        for row in _csv.DictReader(f):
-            cb_stds.append(float(row["best_cb_STD"]))
-            cf_stds.append(float(row["best_cf_STD"]))
-    cb_std_arr = np.array(cb_stds)
-    cf_std_arr = np.array(cf_stds)
-
-    # AAMI/ISO 81060-2: |mean error| <= 5 mmHg AND std <= 8 mmHg
-    # We use MAE as a proxy for |mean error| (conservative)
-    cb_aami = cb_arr.mean() <= 5.0 and cb_std_arr.mean() <= 8.0
-    cf_aami = cf_arr.mean() <= 5.0 and cf_std_arr.mean() <= 8.0
+    # AAMI/ISO 81060-2: |mean(signed error)| <= 5 mmHg AND std(signed error) <= 8 mmHg
+    cb_aami = abs(cb_me.mean()) <= 5.0 and cb_se.mean() <= 8.0
+    cf_aami = abs(cf_me.mean()) <= 5.0 and cf_se.mean() <= 8.0
 
     lines = [
-        f"{'='*60}",
+        f"{'='*65}",
         f"  {N_SPLITS}-Fold CV Results  |  BP={BP}  |  variant={variant}",
-        f"{'='*60}",
-        f"  {'Metric':<22} {'Cal-Based':>12} {'Cal-Free':>12}",
-        f"  {'-'*46}",
-        f"  {'MAE mean (mmHg)':<22} {cb_arr.mean():>12.4f} {cf_arr.mean():>12.4f}",
-        f"  {'MAE std  (mmHg)':<22} {cb_arr.std(ddof=1):>12.4f} {cf_arr.std(ddof=1):>12.4f}",
-        f"  {'STD mean (mmHg)':<22} {cb_std_arr.mean():>12.4f} {cf_std_arr.mean():>12.4f}",
-        f"  {'-'*46}",
-        f"  AAMI/ISO 81060-2 (MAE<=5 AND STD<=8)",
-        f"  Cal-Based : {'PASS ✓' if cb_aami else 'FAIL ✗'}  "
-        f"(MAE={cb_arr.mean():.4f}, STD={cb_std_arr.mean():.4f})",
-        f"  Cal-Free  : {'PASS ✓' if cf_aami else 'FAIL ✗'}  "
-        f"(MAE={cf_arr.mean():.4f}, STD={cf_std_arr.mean():.4f})",
-        f"{'='*60}",
+        f"{'='*65}",
+        f"  {'Metric':<28} {'Cal-Based':>12} {'Cal-Free':>12}",
+        f"  {'-'*52}",
+        f"  {'MAE mean (mmHg)':<28} {cb_mae.mean():>12.4f} {cf_mae.mean():>12.4f}",
+        f"  {'MAE std across folds':<28} {cb_mae.std(ddof=1):>12.4f} {cf_mae.std(ddof=1):>12.4f}",
+        f"  {'Mean signed error (mmHg)':<28} {cb_me.mean():>12.4f} {cf_me.mean():>12.4f}",
+        f"  {'Std signed error (mmHg)':<28} {cb_se.mean():>12.4f} {cf_se.mean():>12.4f}",
+        f"  {'-'*52}",
+        f"  AAMI/ISO 81060-2: |mean_err| <= 5 AND std_err <= 8",
+        f"  Cal-Based : {'PASS' if cb_aami else 'FAIL'}  "
+        f"(mean_err={cb_me.mean():.4f}, std_err={cb_se.mean():.4f})",
+        f"  Cal-Free  : {'PASS' if cf_aami else 'FAIL'}  "
+        f"(mean_err={cf_me.mean():.4f}, std_err={cf_se.mean():.4f})",
+        f"{'='*65}",
     ]
     report = "\n".join(lines)
 
