@@ -18,4 +18,4 @@ export PYTHONUTF8=1
 
 CODE_DIR=/project/rhu/PulseBP/Pulse/PulseDB_multi_full
 
-srun -u python $CODE_DIR/scripts/train_ms4plus_carya.py --bp DBP --variant film
+srun -u /home/yshen28/miniconda3/envs/ppgdata/bin/python $CODE_DIR/scripts/train_ms4plus_carya.py --bp DBP --variant film
