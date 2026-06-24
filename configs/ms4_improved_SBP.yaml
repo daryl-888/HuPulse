@@ -1,0 +1,31 @@
+# MS4Plus configuration — Systolic Blood Pressure
+# Train: python train.py --config configs/ms4_improved_SBP.yaml
+
+target: SBP
+
+# Data
+data_dir: /project/rhu/PulseBP/PulseDB_multi_full
+out_dir:  /project/rhu/dpalfaro/results/ms4plus_SBP
+
+# Model architecture
+d_model:  128   # S4D channel width; bidirectional → 256 at pool
+n_layers: 6     # S4DBlock layers per direction
+d_state:  32    # S4D state dimension (16 complex pairs)
+dropout:  0.1
+
+# Training
+batch_size:    64
+num_workers:   8
+epochs:        150
+warmup_epochs: 10
+
+# Optimiser (AdamW)
+lr:           3.0e-4
+weight_decay: 0.01
+
+# Loss: Huber (SmoothL1) with delta=5 mmHg
+# Quadratic for |error| < 5 mmHg, linear beyond → robust to outliers
+huber_delta: 5.0
+
+# Gradient clipping (important for S4 stability)
+grad_clip: 1.0

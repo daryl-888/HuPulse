@@ -1,0 +1,30 @@
+# MS4Plus configuration — Diastolic Blood Pressure
+# Train: python train.py --config configs/ms4_improved_DBP.yaml
+
+target: DBP
+
+# Data
+data_dir: /project/rhu/PulseBP/PulseDB_multi_full
+out_dir:  /project/rhu/dpalfaro/results/ms4plus_DBP
+
+# Model architecture (identical to SBP model)
+d_model:  128
+n_layers: 6
+d_state:  32
+dropout:  0.1
+
+# Training
+batch_size:    64
+num_workers:   8
+epochs:        150
+warmup_epochs: 10
+
+# Optimiser
+lr:           3.0e-4
+weight_decay: 0.01
+
+# Loss
+huber_delta: 5.0
+
+# Gradient clipping
+grad_clip: 1.0
