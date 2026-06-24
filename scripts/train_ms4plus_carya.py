@@ -88,80 +88,190 @@ class S4Model(nn.Module):
         return x
 
 # =============================================================================
-# Fusion variant models — only fusion changes, S4Model is identical above
+# Building blocks — matches deploy/MS4.py exactly (MS4_2-based architecture)
 # =============================================================================
 
-def _make_s4(d_model=512, n_layers=4, d_state=64, l_max=2048):
-    return S4Model(d_input=1, d_output=None, d_state=d_state,
-                   d_model=d_model, n_layers=n_layers, pooling=True, l_max=l_max)
+class S4Block(nn.Module):
+    """Pre-norm residual block: S4 + pointwise FFN."""
+    def __init__(self, d_model, d_state=64, l_max=2048, dropout=0.2, bidirectional=True):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.s4 = S42(d_state=d_state, l_max=l_max, d_model=d_model,
+                      bidirectional=bidirectional, postact='glu',
+                      dropout=dropout, transposed=True)
+        self.drop = nn.Dropout(dropout)
+        self.ffn = nn.Sequential(
+            nn.Conv1d(d_model, 4 * d_model, kernel_size=1), nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Conv1d(4 * d_model, d_model, kernel_size=1),
+        )
 
-def _make_head(D, dropout=0.1, num_BP=1):
-    return nn.Sequential(
-        nn.Linear(D, 256), nn.ReLU(inplace=True),
-        nn.Dropout(dropout),
-        nn.Linear(256, 32), nn.ReLU(inplace=True),
-        nn.Linear(32, num_BP),
-    )
+    def forward(self, x, rate=1.0):  # x: (B, C, L)
+        y = self.norm1(x.transpose(-1, -2)).transpose(-1, -2)
+        y, _ = self.s4(y, rate=rate)
+        x = x + self.drop(y)
+        y = self.norm2(x.transpose(-1, -2)).transpose(-1, -2)
+        x = x + self.drop(self.ffn(y))
+        return x
 
-def _make_demo_mlp(in_dim=3, hidden=64):
-    return nn.Sequential(
-        nn.Linear(in_dim, hidden), nn.GELU(),
-        nn.Linear(hidden, hidden), nn.GELU(),
-    )
 
+class AttnPool1D(nn.Module):
+    """Learned attention pooling over time."""
+    def __init__(self, d_model, hidden=128):
+        super().__init__()
+        self.scorer = nn.Sequential(nn.Linear(d_model, hidden), nn.Tanh(), nn.Linear(hidden, 1))
+
+    def forward(self, x):  # x: (B, L, C)
+        w = torch.softmax(self.scorer(x).squeeze(-1), dim=1)
+        return torch.bmm(w.unsqueeze(1), x).squeeze(1)
+
+
+class _FiLM(nn.Module):
+    """FiLM on sequence (B, L, C) given static embedding (B, D)."""
+    def __init__(self, static_dim, d_model):
+        super().__init__()
+        self.proj = nn.Linear(static_dim, 2 * d_model)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x, s):
+        gamma, beta = self.proj(s).chunk(2, dim=-1)
+        return x * (1.0 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
+
+
+class _Gate(nn.Module):
+    """Sigmoid gate on sequence (B, L, C) given static embedding (B, D)."""
+    def __init__(self, static_dim, d_model):
+        super().__init__()
+        self.proj = nn.Linear(static_dim, d_model)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.constant_(self.proj.bias, 1.0)
+
+    def forward(self, x, s):
+        g = torch.sigmoid(self.proj(s)).unsqueeze(1)
+        return x * g
+
+
+# =============================================================================
+# Variant models — conv stem + S4Blocks + sequence fusion + AttnPool
+# (same architecture as deploy/MS4.py; only fusion mechanism differs)
+# =============================================================================
 
 class MS4_FiLM(nn.Module):
-    """FiLM: demographics predict scale+shift of 512-dim S4 output."""
-    def __init__(self, num_static_features=3, num_BP=1, D=512, demo_hidden=64, dropout=0.1):
+    """Conv stem → S4Blocks → sequence FiLM → AttnPool → head."""
+    def __init__(self, num_static_features=3, num_BP=1,
+                 static_hidden=32, fusion_hidden=64,
+                 s4_d_input=1, s4_d_model=256, s4_n_layers=4,
+                 s4_l_max=2048, dropout=0.2):
         super().__init__()
-        self.s4model  = _make_s4(D)
-        self.demo_mlp = _make_demo_mlp(num_static_features, demo_hidden)
-        self.film = nn.Linear(demo_hidden, D * 2)
-        nn.init.zeros_(self.film.weight); nn.init.zeros_(self.film.bias)
-        self.head = _make_head(D, dropout, num_BP)
+        D = s4_d_model
+        self.stem = nn.Sequential(
+            nn.Conv1d(s4_d_input, D, kernel_size=5, padding=2), nn.GELU(),
+            nn.Conv1d(D, D, kernel_size=3, padding=1), nn.GELU(),
+        )
+        self.blocks = nn.ModuleList([
+            S4Block(D, d_state=64, l_max=s4_l_max, dropout=dropout)
+            for _ in range(s4_n_layers)
+        ])
+        self.static_mlp = nn.Sequential(
+            nn.Linear(num_static_features, static_hidden), nn.ReLU(inplace=True),
+            nn.Linear(static_hidden, static_hidden), nn.ReLU(inplace=True),
+        )
+        self.film = _FiLM(static_hidden, D)
+        self.pool = AttnPool1D(D, hidden=128)
+        self.head = nn.Sequential(
+            nn.Linear(D + static_hidden, fusion_hidden), nn.ReLU(inplace=True),
+            nn.Dropout(dropout), nn.Linear(fusion_hidden, num_BP),
+        )
 
     def forward(self, ppg, static_feat):
-        s4_out = self.s4model(ppg)
-        demo   = self.demo_mlp(static_feat)
-        params = self.film(demo)
-        gamma, beta = params[:, :512], params[:, 512:]
-        return self.head((1.0 + gamma) * s4_out + beta).squeeze(-1)
+        x = self.stem(ppg)
+        for blk in self.blocks:
+            x = blk(x)
+        x = x.transpose(-1, -2)
+        s = self.static_mlp(static_feat)
+        x = self.film(x, s)
+        x = self.pool(x)
+        return self.head(torch.cat([x, s], dim=-1)).squeeze(-1)
 
 
 class MS4_Gate(nn.Module):
-    """Gate: demographics predict sigmoid gate over 512-dim S4 output."""
-    def __init__(self, num_static_features=3, num_BP=1, D=512, demo_hidden=64, dropout=0.1):
+    """Conv stem → S4Blocks → sequence gate → AttnPool → head."""
+    def __init__(self, num_static_features=3, num_BP=1,
+                 static_hidden=32, fusion_hidden=64,
+                 s4_d_input=1, s4_d_model=256, s4_n_layers=4,
+                 s4_l_max=2048, dropout=0.2):
         super().__init__()
-        self.s4model  = _make_s4(D)
-        self.demo_mlp = _make_demo_mlp(num_static_features, demo_hidden)
-        self.gate = nn.Linear(demo_hidden, D)
-        nn.init.zeros_(self.gate.weight); nn.init.constant_(self.gate.bias, 1.0)
-        self.head = _make_head(D, dropout, num_BP)
+        D = s4_d_model
+        self.stem = nn.Sequential(
+            nn.Conv1d(s4_d_input, D, kernel_size=5, padding=2), nn.GELU(),
+            nn.Conv1d(D, D, kernel_size=3, padding=1), nn.GELU(),
+        )
+        self.blocks = nn.ModuleList([
+            S4Block(D, d_state=64, l_max=s4_l_max, dropout=dropout)
+            for _ in range(s4_n_layers)
+        ])
+        self.static_mlp = nn.Sequential(
+            nn.Linear(num_static_features, static_hidden), nn.ReLU(inplace=True),
+            nn.Linear(static_hidden, static_hidden), nn.ReLU(inplace=True),
+        )
+        self.gate = _Gate(static_hidden, D)
+        self.pool = AttnPool1D(D, hidden=128)
+        self.head = nn.Sequential(
+            nn.Linear(D + static_hidden, fusion_hidden), nn.ReLU(inplace=True),
+            nn.Dropout(dropout), nn.Linear(fusion_hidden, num_BP),
+        )
 
     def forward(self, ppg, static_feat):
-        s4_out = self.s4model(ppg)
-        demo   = self.demo_mlp(static_feat)
-        return self.head(s4_out * torch.sigmoid(self.gate(demo))).squeeze(-1)
+        x = self.stem(ppg)
+        for blk in self.blocks:
+            x = blk(x)
+        x = x.transpose(-1, -2)
+        s = self.static_mlp(static_feat)
+        x = self.gate(x, s)
+        x = self.pool(x)
+        return self.head(torch.cat([x, s], dim=-1)).squeeze(-1)
 
 
 class MS4_FiLMGate(nn.Module):
-    """FiLM then gate combined."""
-    def __init__(self, num_static_features=3, num_BP=1, D=512, demo_hidden=64, dropout=0.1):
+    """Conv stem → S4Blocks → sequence FiLM then gate → AttnPool → head."""
+    def __init__(self, num_static_features=3, num_BP=1,
+                 static_hidden=32, fusion_hidden=64,
+                 s4_d_input=1, s4_d_model=256, s4_n_layers=4,
+                 s4_l_max=2048, dropout=0.2):
         super().__init__()
-        self.s4model  = _make_s4(D)
-        self.demo_mlp = _make_demo_mlp(num_static_features, demo_hidden)
-        self.film = nn.Linear(demo_hidden, D * 2)
-        nn.init.zeros_(self.film.weight); nn.init.zeros_(self.film.bias)
-        self.gate = nn.Linear(demo_hidden, D)
-        nn.init.zeros_(self.gate.weight); nn.init.constant_(self.gate.bias, 1.0)
-        self.head = _make_head(D, dropout, num_BP)
+        D = s4_d_model
+        self.stem = nn.Sequential(
+            nn.Conv1d(s4_d_input, D, kernel_size=5, padding=2), nn.GELU(),
+            nn.Conv1d(D, D, kernel_size=3, padding=1), nn.GELU(),
+        )
+        self.blocks = nn.ModuleList([
+            S4Block(D, d_state=64, l_max=s4_l_max, dropout=dropout)
+            for _ in range(s4_n_layers)
+        ])
+        self.static_mlp = nn.Sequential(
+            nn.Linear(num_static_features, static_hidden), nn.ReLU(inplace=True),
+            nn.Linear(static_hidden, static_hidden), nn.ReLU(inplace=True),
+        )
+        self.film = _FiLM(static_hidden, D)
+        self.gate = _Gate(static_hidden, D)
+        self.pool = AttnPool1D(D, hidden=128)
+        self.head = nn.Sequential(
+            nn.Linear(D + static_hidden, fusion_hidden), nn.ReLU(inplace=True),
+            nn.Dropout(dropout), nn.Linear(fusion_hidden, num_BP),
+        )
 
     def forward(self, ppg, static_feat):
-        s4_out = self.s4model(ppg)
-        demo   = self.demo_mlp(static_feat)
-        p      = self.film(demo)
-        s4_out = (1.0 + p[:, :512]) * s4_out + p[:, 512:]
-        return self.head(s4_out * torch.sigmoid(self.gate(demo))).squeeze(-1)
+        x = self.stem(ppg)
+        for blk in self.blocks:
+            x = blk(x)
+        x = x.transpose(-1, -2)
+        s = self.static_mlp(static_feat)
+        x = self.film(x, s)
+        x = self.gate(x, s)
+        x = self.pool(x)
+        return self.head(torch.cat([x, s], dim=-1)).squeeze(-1)
 
 
 VARIANTS = {"film": MS4_FiLM, "gate": MS4_Gate, "filmgate": MS4_FiLMGate}
