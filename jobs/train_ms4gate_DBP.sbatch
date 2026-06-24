@@ -7,7 +7,7 @@
 #SBATCH --gres=gpu:2
 #SBATCH -p gpu
 #SBATCH --mem=300G
-#SBATCH --time=10-00:00:00
+#SBATCH --time=7-00:00:00
 
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
 export CUDA_HOME=/share/apps/cuda/11.3
