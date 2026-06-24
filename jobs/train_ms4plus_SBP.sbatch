@@ -1,31 +1,21 @@
 #!/bin/bash
-#SBATCH -J ms4plus_SBP
-#SBATCH -o /project/rhu/dpalfaro/results/ms4plus_SBP_%j.out
-#SBATCH -e /project/rhu/dpalfaro/results/ms4plus_SBP_%j.err
+#SBATCH --job-name=MS4film_SBP
+#SBATCH --output=MS4film_SBP_%j.out
+#SBATCH --error=MS4film_SBP_%j.out
 #SBATCH -N 1
-#SBATCH -n 8
-#SBATCH --gpus=ada:1
-#SBATCH --mem=64G
-#SBATCH -t 24:00:00
-#SBATCH --mail-type=END,FAIL
-#SBATCH --mail-user=dpalfaro@cougarnet.uh.edu
+#SBATCH -n 1
+#SBATCH --gres=gpu:2
+#SBATCH -p gpu
+#SBATCH --mem=300G
+#SBATCH --time=10-00:00:00
 
-CODE_DIR=/project/rhu/dpalfaro/code/HuPulse
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
+export CUDA_HOME=/share/apps/cuda/11.3
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+export PYTHONIOENCODING=utf-8
+export PYTHONUTF8=1
 
-# Use Yidan's shared ppgdata environment (Python 3.8 + PyTorch 1.10.1+cu113 + mat73)
-PYTHON=/home/yshen28/miniconda3/envs/ppgdata/bin/python
-# If you installed your own copy via setup_env.sbatch, use instead:
-# PYTHON=/project/rhu/dpalfaro/conda/envs/ppgdata/bin/python
+CODE_DIR=/project/rhu/PulseBP/Pulse/PulseDB_multi_full
 
-mkdir -p /project/rhu/dpalfaro/results
-
-cd $CODE_DIR
-
-echo "=== MS4Plus SBP — 10-fold CV ==="
-echo "Node : $(hostname)"
-echo "GPU  : $(nvidia-smi --query-gpu=name --format=csv,noheader)"
-echo "Start: $(date)"
-
-$PYTHON scripts/train_ms4plus_carya.py --bp SBP
-
-echo "End: $(date)"
+srun -u python $CODE_DIR/scripts/train_ms4plus_carya.py --bp SBP --variant film
