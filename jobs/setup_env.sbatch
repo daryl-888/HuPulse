@@ -8,15 +8,22 @@
 #SBATCH -p batch
 #SBATCH --time=2:00:00
 
-# Carya's shared conda base (from `conda env list` base entry)
+set -e
+
 CONDA_BASE=/project/dsi/apps/easybuild/software/Miniforge3/24.1.2-0
 source $CONDA_BASE/etc/profile.d/conda.sh
 
 ENV_PREFIX=/project/rhu/dpalfaro/conda/envs/ppgdata
 YML=$HOME/ppgdata_environment.yml
 
+# Remove stale partial install if it exists
+if [ -d "$ENV_PREFIX" ]; then
+    echo "Removing existing partial env at $ENV_PREFIX"
+    conda env remove --prefix $ENV_PREFIX -y
+fi
+
 echo "Creating ppgdata env at $ENV_PREFIX"
-conda env create -f $YML --prefix $ENV_PREFIX --force
+conda env create -f $YML --prefix $ENV_PREFIX
 
 echo "Done. Python at: $ENV_PREFIX/bin/python"
 $ENV_PREFIX/bin/python --version
