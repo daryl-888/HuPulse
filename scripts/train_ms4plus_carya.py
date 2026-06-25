@@ -277,7 +277,50 @@ class MS4_FiLMGate(nn.Module):
         return self.head(torch.cat([x, s], dim=-1)).squeeze(-1)
 
 
-VARIANTS = {"film": MS4_FiLM, "gate": MS4_Gate, "filmgate": MS4_FiLMGate}
+class MS4_FiLMOnly(nn.Module):
+    """
+    CLEAN ABLATION — original MS4 baseline with ONLY the fusion swapped.
+
+    Identical to the paper's MS4 baseline (S4Model d_model=512, mean-pool,
+    no conv stem, no FFN, no attention pool) EXCEPT demographics are injected
+    via FiLM on the pooled vector instead of plain concatenation.
+
+    Purpose: isolate the contribution of demographic conditioning alone, so a
+    win can be attributed to the fusion mechanism rather than to the conv
+    stem / FFN / attention-pool additions in the other variants.
+    """
+    def __init__(self, num_static_features=3, num_BP=1, D=512, demo_hidden=16, dropout=0.1):
+        super().__init__()
+        self.s4model = S4Model(d_input=1, d_output=None, d_state=64,
+                               d_model=D, n_layers=4, l_max=2048, pooling=True)
+        self.demo_mlp = nn.Sequential(
+            nn.Linear(num_static_features, demo_hidden), nn.ReLU(inplace=True),
+            nn.Linear(demo_hidden, demo_hidden), nn.ReLU(inplace=True),
+        )
+        # FiLM params from demographics; zero-init -> starts as identity (= baseline)
+        self.film = nn.Linear(demo_hidden, 2 * D)
+        nn.init.zeros_(self.film.weight); nn.init.zeros_(self.film.bias)
+        self.ppg_mlp = nn.Sequential(
+            nn.Linear(D, 256), nn.ReLU(inplace=True), nn.Linear(256, 128), nn.ReLU(inplace=True),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(128, 32), nn.ReLU(inplace=True), nn.Dropout(dropout), nn.Linear(32, num_BP),
+        )
+
+    def forward(self, ppg, static_feat):
+        feat = self.s4model(ppg)                       # (B, 512) mean-pooled
+        d = self.demo_mlp(static_feat)                 # (B, 16)
+        gamma, beta = self.film(d).chunk(2, dim=-1)    # (B, 512) each
+        feat = feat * (1.0 + gamma) + beta             # FiLM on pooled vector
+        return self.head(self.ppg_mlp(feat)).squeeze(-1)
+
+
+VARIANTS = {
+    "film": MS4_FiLM,
+    "gate": MS4_Gate,
+    "filmgate": MS4_FiLMGate,
+    "film_baseline": MS4_FiLMOnly,   # clean ablation: baseline + FiLM only
+}
 
 # =============================================================================
 # Settings

@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=MS4gate_DBP
-#SBATCH --output=MS4gate_DBP_%j.out
-#SBATCH --error=MS4gate_DBP_%j.out
+#SBATCH --job-name=MS4fb_SBP
+#SBATCH --output=MS4fb_SBP_%j.out
+#SBATCH --error=MS4fb_SBP_%j.out
 #SBATCH -N 1
 #SBATCH -n 1
 #SBATCH --gres=gpu:2
@@ -18,4 +18,4 @@ export PYTHONUTF8=1
 
 CODE_DIR=/project/rhu/PulseBP/Pulse/PulseDB_multi_full
 
-srun -u /project/rhu/dpalfaro/conda/envs/ppgdata/bin/python $CODE_DIR/scripts/train_ms4plus_carya.py --bp DBP --variant gate
+srun -u /project/rhu/dpalfaro/conda/envs/ppgdata/bin/python $CODE_DIR/scripts/train_ms4plus_carya.py --bp SBP --variant film_baseline

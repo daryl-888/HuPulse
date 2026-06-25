@@ -9,7 +9,7 @@
 #SBATCH --mem=300G
 #SBATCH --time=7-00:00:00
 
-export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
+export LD_LIBRARY_PATH="/project/rhu/dpalfaro/conda/envs/ppgdata/lib:$LD_LIBRARY_PATH"
 export CUDA_HOME=/share/apps/cuda/11.3
 export PATH=$CUDA_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
