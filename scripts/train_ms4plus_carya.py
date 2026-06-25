@@ -100,6 +100,7 @@ class S4Block(nn.Module):
         self.s4 = S42(d_state=d_state, l_max=l_max, d_model=d_model,
                       bidirectional=bidirectional, postact='glu',
                       dropout=dropout, transposed=True)
+        self._bidir = bidirectional
         self.drop = nn.Dropout(dropout)
         self.ffn = nn.Sequential(
             nn.Conv1d(d_model, 4 * d_model, kernel_size=1), nn.GELU(),
@@ -163,7 +164,7 @@ class MS4_FiLM(nn.Module):
     def __init__(self, num_static_features=3, num_BP=1,
                  static_hidden=32, fusion_hidden=64,
                  s4_d_input=1, s4_d_model=256, s4_n_layers=4,
-                 s4_l_max=2048, dropout=0.2):
+                 s4_l_max=2048, dropout=0.2, bidirectional=True):
         super().__init__()
         D = s4_d_model
         self.stem = nn.Sequential(
@@ -171,7 +172,8 @@ class MS4_FiLM(nn.Module):
             nn.Conv1d(D, D, kernel_size=3, padding=1), nn.GELU(),
         )
         self.blocks = nn.ModuleList([
-            S4Block(D, d_state=64, l_max=s4_l_max, dropout=dropout)
+            S4Block(D, d_state=64, l_max=s4_l_max, dropout=dropout,
+                    bidirectional=bidirectional)
             for _ in range(s4_n_layers)
         ])
         self.static_norm = nn.BatchNorm1d(num_static_features)
@@ -202,7 +204,7 @@ class MS4_Gate(nn.Module):
     def __init__(self, num_static_features=3, num_BP=1,
                  static_hidden=32, fusion_hidden=64,
                  s4_d_input=1, s4_d_model=256, s4_n_layers=4,
-                 s4_l_max=2048, dropout=0.2):
+                 s4_l_max=2048, dropout=0.2, bidirectional=True):
         super().__init__()
         D = s4_d_model
         self.stem = nn.Sequential(
@@ -210,7 +212,8 @@ class MS4_Gate(nn.Module):
             nn.Conv1d(D, D, kernel_size=3, padding=1), nn.GELU(),
         )
         self.blocks = nn.ModuleList([
-            S4Block(D, d_state=64, l_max=s4_l_max, dropout=dropout)
+            S4Block(D, d_state=64, l_max=s4_l_max, dropout=dropout,
+                    bidirectional=bidirectional)
             for _ in range(s4_n_layers)
         ])
         self.static_norm = nn.BatchNorm1d(num_static_features)
@@ -241,7 +244,7 @@ class MS4_FiLMGate(nn.Module):
     def __init__(self, num_static_features=3, num_BP=1,
                  static_hidden=32, fusion_hidden=64,
                  s4_d_input=1, s4_d_model=256, s4_n_layers=4,
-                 s4_l_max=2048, dropout=0.2):
+                 s4_l_max=2048, dropout=0.2, bidirectional=True):
         super().__init__()
         D = s4_d_model
         self.stem = nn.Sequential(
@@ -249,7 +252,8 @@ class MS4_FiLMGate(nn.Module):
             nn.Conv1d(D, D, kernel_size=3, padding=1), nn.GELU(),
         )
         self.blocks = nn.ModuleList([
-            S4Block(D, d_state=64, l_max=s4_l_max, dropout=dropout)
+            S4Block(D, d_state=64, l_max=s4_l_max, dropout=dropout,
+                    bidirectional=bidirectional)
             for _ in range(s4_n_layers)
         ])
         self.static_norm = nn.BatchNorm1d(num_static_features)
@@ -433,15 +437,19 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--bp",      choices=["SBP", "DBP"], default="SBP")
     parser.add_argument("--variant", choices=list(VARIANTS),  default="film",
-                        help="Fusion variant: film | gate | filmgate")
+                        help="Fusion variant: film | gate | filmgate | film_baseline")
+    parser.add_argument("--no-bidir", dest="bidir", action="store_false",
+                        help="Use unidirectional S4 (default: bidirectional)")
+    parser.set_defaults(bidir=True)
     args = parser.parse_args()
 
-    BP, variant = args.bp, args.variant
-    OUT_DIR = f"./ms4_{variant}_cv_{BP.lower()}"
+    BP, variant, bidir = args.bp, args.variant, args.bidir
+    bidir_tag = "bidir" if bidir else "uni"
+    OUT_DIR = f"./ms4_{variant}_{bidir_tag}_cv_{BP.lower()}"
     os.makedirs(OUT_DIR, exist_ok=True)
 
     Seed(SEED)
-    print(f"BP={BP}  variant={variant}  out={OUT_DIR}")
+    print(f"BP={BP}  variant={variant}  bidirectional={bidir}  out={OUT_DIR}")
 
     train_data = Build_Dataset(TRAIN_FILE,         BP)
     cb_data    = Build_Dataset(TEST_CALBASED_FILE, BP)
@@ -481,7 +489,10 @@ def main():
         train_loader = DataLoader(ds_train, batch_size=BATCH_SIZE, shuffle=True, drop_last=False)
 
         Seed(SEED + fold_id)
-        _model    = ModelCls(num_static_features=3, num_BP=1).to(device)
+        _model_kwargs = {"num_static_features": 3, "num_BP": 1}
+        if variant != "film_baseline":   # film_baseline uses S4Model which has its own bidir
+            _model_kwargs["bidirectional"] = bidir
+        _model    = ModelCls(**_model_kwargs).to(device)
         model     = nn.DataParallel(_model) if n_gpus > 1 else _model
         optimizer = torch.optim.Adam(_model.parameters(), lr=LR, betas=BETAS, weight_decay=WEIGHT_DECAY)
         criterion = nn.MSELoss()
@@ -550,7 +561,7 @@ def main():
 
     lines = [
         f"{'='*65}",
-        f"  {N_SPLITS}-Fold CV Results  |  BP={BP}  |  variant={variant}",
+        f"  {N_SPLITS}-Fold CV Results  |  BP={BP}  |  variant={variant}  |  S4={'bidir' if bidir else 'uni'}",
         f"{'='*65}",
         f"  {'Metric':<28} {'Cal-Based':>12} {'Cal-Free':>12}",
         f"  {'-'*52}",

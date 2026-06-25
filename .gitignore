@@ -27,6 +27,8 @@ wandb/
 lightning_logs/
 ms4_*_cv_*/
 mresnet50_*_cv_*/
+vit1d_cv_*/
+vit1d_film_cv_*/
 
 # Conda / Python
 __pycache__/
