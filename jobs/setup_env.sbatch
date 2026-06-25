@@ -1,28 +1,22 @@
 #!/bin/bash
-# Create the ppgdata conda environment from the shared environment.yml.
-# Run once: sbatch jobs/setup_env.sbatch
-# NOTE: This job does NOT need a GPU.
-#SBATCH -J setup_ppgdata_env
-#SBATCH -o /project/rhu/dpalfaro/results/setup_env_%j.out
-#SBATCH -e /project/rhu/dpalfaro/results/setup_env_%j.err
+#SBATCH --job-name=setup_ppgdata
+#SBATCH --output=setup_ppgdata_%j.out
+#SBATCH --error=setup_ppgdata_%j.out
 #SBATCH -N 1
 #SBATCH -n 8
 #SBATCH --mem=32G
-#SBATCH -t 02:00:00
-#SBATCH --mail-type=END
-#SBATCH --mail-user=dpalfaro@cougarnet.uh.edu
+#SBATCH -p batch
+#SBATCH --time=2:00:00
 
-CODE_DIR=/project/rhu/dpalfaro/code/HuPulse
-
-# If you have a personal conda installation, adjust the path:
-CONDA_BASE=/project/rhu/dpalfaro/conda
+# Carya's shared conda base (from `conda env list` base entry)
+CONDA_BASE=/project/dsi/apps/easybuild/software/Miniforge3/24.1.2-0
 source $CONDA_BASE/etc/profile.d/conda.sh
 
-# Create env from the shared yml (name will be 'ppgdata' as per the yml)
-# --prefix installs into your project space to avoid home-dir quota issues
-conda env create \
-    -f $CODE_DIR/ppgdata_environment.yml \
-    --prefix $CONDA_BASE/envs/ppgdata \
-    --force
+ENV_PREFIX=/project/rhu/dpalfaro/conda/envs/ppgdata
+YML=$HOME/ppgdata_environment.yml
 
-echo "Environment ready at: $CONDA_BASE/envs/ppgdata"
+echo "Creating ppgdata env at $ENV_PREFIX"
+conda env create -f $YML --prefix $ENV_PREFIX --force
+
+echo "Done. Python at: $ENV_PREFIX/bin/python"
+$ENV_PREFIX/bin/python --version
