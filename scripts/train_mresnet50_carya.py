@@ -37,18 +37,23 @@ _CARYA_MODEL_TRAINING = "/project/rhu/PulseBP/Pulse/PulseDB_multi_full/Model_Tra
 sys.path.insert(0, _CARYA_MODEL_TRAINING)
 
 try:
-    from Model_Def.MResNet50 import MResNet50_1D as _MResNetCls
-    print("Loaded MResNet50_1D from Carya Model_Def")
+    from Model_Def.MResNet50 import MResnet50_1D as _MResNetCls
+    print("Loaded MResnet50_1D from Carya Model_Def")
     _CARYA_API = True
 except (ImportError, AttributeError):
     try:
-        from Model_Def.MResNet50 import MResNet50 as _MResNetCls
-        print("Loaded MResNet50 from Carya Model_Def")
+        from Model_Def.MResNet50 import MResNet50_1D as _MResNetCls
+        print("Loaded MResNet50_1D from Carya Model_Def")
         _CARYA_API = True
-    except ImportError:
-        _MResNetCls = None
-        _CARYA_API  = False
-        print("WARNING: Could not import from Carya Model_Def — using inline fallback")
+    except (ImportError, AttributeError):
+        try:
+            from Model_Def.MResNet50 import MResNet50 as _MResNetCls
+            print("Loaded MResNet50 from Carya Model_Def")
+            _CARYA_API = True
+        except ImportError:
+            _MResNetCls = None
+            _CARYA_API  = False
+            print("WARNING: Could not import from Carya Model_Def — using inline fallback")
 
 
 # ── Inline fallback (matches paper spec exactly) ──────────────────────────────
