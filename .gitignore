@@ -1,0 +1,53 @@
+# Model weights and checkpoints
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.safetensors
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+
+# Large data files
+*.mat
+*.npy
+*.npz
+*.csv
+*.parquet
+*.feather
+
+# Training outputs / logs
+*.out
+*.log
+runs/
+outputs/
+checkpoints/
+wandb/
+lightning_logs/
+ms4_*_cv_*/
+mresnet50_*_cv_*/
+
+# Conda / Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+.env
+.venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
