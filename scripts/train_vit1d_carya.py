@@ -160,8 +160,10 @@ DROPOUT    = 0.1
 # Training settings — identical to paper bootstrap
 # =============================================================================
 
-DATA_FOLDER        = "/home/yshen28/PPGdata_filtered"
-TRAIN_FILE         = os.path.join(DATA_FOLDER, "Train_Subset_filtered.mat")
+DATA_FOLDER        = "/project/rhu/PulseBP/Pulse/pulsedb/PulseDB/Subset_Files"
+_train_filtered    = os.path.join(DATA_FOLDER, "Train_Subset_filtered.mat")
+_train_fallback    = os.path.join(DATA_FOLDER, "AAMI_Cal_Subset.mat")
+TRAIN_FILE         = _train_filtered if os.path.exists(_train_filtered) else _train_fallback
 TEST_CALBASED_FILE = os.path.join(DATA_FOLDER, "CalBased_Test_Subset_filtered.mat")
 TEST_CALFREE_FILE  = os.path.join(DATA_FOLDER, "CalFree_Test_Subset_filtered.mat")
 
